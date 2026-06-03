@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Handoff Review"
+  short_description: "Review AI code with explicit handoff context"
+  default_prompt: "Use $codex-handoff-review to review AI-generated code against a handoff brief and current diff."
