@@ -25,7 +25,7 @@ Claude Code session starts
 When Claude Code tries to stop:
 
 1. `SessionStart` records the starting Git status and diff for the Claude Code session.
-2. `PostToolUse` records files touched by Claude file-edit tools such as `Edit`, `Write`, and `MultiEdit`.
+2. `PostToolUse` records files touched by Claude file-edit tools such as `Edit`, `Write`, `MultiEdit`, `NotebookEdit`, and Git changes observed after `Bash`.
 3. `Stop` checks whether the current directory is a Git repository with local changes.
 4. If there are changes, it reads recent user/assistant transcript text from the current Claude session.
 5. It blocks before Codex runs if the visible transcript or brief appears to contain secrets.
@@ -91,6 +91,8 @@ Set environment variables before launching Claude Code to tune that behavior:
 | `CODEX_HANDOFF_REVIEW_MAX_TRANSCRIPT_CHARS` | number | `20000` | Recent transcript text passed to Codex. |
 | `CODEX_HANDOFF_REVIEW_MAX_BASELINE_DIFF_CHARS` | number | `50000` | Baseline diff chars recorded at `SessionStart`. |
 | `CODEX_HANDOFF_REVIEW_MAX_BASELINE_CHARS` | number | `50000` | Baseline chars included in the Codex prompt. |
+| `CODEX_HANDOFF_REVIEW_BASE_REF` | git ref | inferred | Optional branch/PR base ref, for example `origin/master`. |
+| `CODEX_HANDOFF_REVIEW_HISTORY_LIMIT` | number | `100` | Timestamped review markdown files to keep in plugin data. |
 | `CODEX_HANDOFF_REVIEW_MAX_CHANGED_FILES` | number | `80` | Changed files listed in the Codex prompt. |
 | `CODEX_HANDOFF_REVIEW_MAX_TRACKED_FILES` | number | `80` | Claude file-tool touched files listed in the Codex prompt. |
 | `CODEX_HANDOFF_REVIEW_MAX_OUTPUT_CHARS` | number | `8000` | Review text included in hook block reason. |
@@ -113,6 +115,12 @@ claude
 
 ```text
 ${CLAUDE_PLUGIN_DATA}/latest-review.md
+```
+
+Machine-readable metadata is written to:
+
+```text
+${CLAUDE_PLUGIN_DATA}/latest-review.json
 ```
 
 The hook also writes timestamped review files in the same directory.
@@ -141,7 +149,7 @@ The hook asks Codex to check:
 - Error, null, empty, concurrent, and idempotent paths
 - Missing or weak validation
 
-Codex also receives a changed-file list, Claude file-tool touched files, and an automatic handoff brief when no explicit brief exists. It must include these sections after the required prefix:
+Codex also receives a changed-file list, Claude/Bash-touched files, branch/PR diff stat when a base ref is available, and an automatic handoff brief when no explicit brief exists. It must include these sections after the required prefix:
 
 ```text
 Findings
@@ -188,7 +196,7 @@ npm test
 claude plugin validate .
 ```
 
-The smoke test creates a temporary Git repo and fake `codex` command, then verifies both `ALLOW:` and `BLOCK:` paths without calling the real Codex CLI. It also covers baseline detection, PostToolUse file tracking, clean-repo no-op behavior, fail-open missing Codex, secret blocking, changed-file reporting, and mismatched baseline fallback.
+The smoke test creates a temporary Git repo and fake `codex` command, then verifies both `ALLOW:` and `BLOCK:` paths without calling the real Codex CLI. It also covers baseline detection, PostToolUse file tracking, Bash/Notebook tracking, clean-repo no-op behavior, fail-open missing Codex, secret blocking, diff secret blocking, metadata output, changed-file reporting, and mismatched baseline fallback.
 
 ## Important Limits
 
@@ -196,7 +204,7 @@ The smoke test creates a temporary Git repo and fake `codex` command, then verif
 - Codex still cannot see hidden Claude reasoning.
 - Codex receives recent visible transcript text, the last assistant message, optional brief files, and Git facts.
 - A local secret scan runs before Codex receives context, but it is pattern-based and cannot guarantee every secret is caught.
-- PostToolUse file tracking only records Claude file-edit tool calls that the hook receives. Shell commands that edit files are not attributed as Claude file-tool edits, though Git diff still catches the resulting changes.
+- PostToolUse file tracking records Claude file-edit tool calls and, for `Bash`, snapshots the current Git changed files after the command. It cannot prove exactly which shell command caused each changed file.
 - The session baseline helps separate pre-existing changes from current-session changes. It cannot perfectly reconstruct a per-message patch if the repository starts dirty and Claude edits the same lines later.
 - For exact per-task review, start Claude Code from a clean Git state or write a task-specific `review-brief.md`.
 - The hook passes recent visible Claude transcript text to Codex. Do not include secrets in prompts.

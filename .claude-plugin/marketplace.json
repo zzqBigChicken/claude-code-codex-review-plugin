@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Claude Code plugin that automatically runs a Codex review gate after AI-generated code changes.",
-    "version": "0.6.0"
+    "version": "0.7.0"
   },
   "plugins": [
     {
       "name": "codex-handoff-review",
       "description": "Claude Code plugin that automatically runs a Codex review gate after AI-generated code changes.",
-      "version": "0.6.0",
+      "version": "0.7.0",
       "author": {
         "name": "zzqBigChicken"
       },

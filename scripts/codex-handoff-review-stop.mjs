@@ -16,6 +16,7 @@ const DEFAULT_FAIL_MODE = "block";
 const DEFAULT_MAX_BASELINE_CHARS = 50000;
 const DEFAULT_MAX_CHANGED_FILES = 80;
 const DEFAULT_MAX_TRACKED_FILES = 80;
+const DEFAULT_HISTORY_LIMIT = 100;
 const SECRET_PATTERNS = [
   { name: "GitHub token", pattern: /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}\b/g },
   { name: "GitHub fine-grained token", pattern: /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g },
@@ -111,6 +112,19 @@ function gitOutput(cwd, args) {
   return result.stdout || "";
 }
 
+function gitCurrentBranch(cwd) {
+  return gitOutput(cwd, ["branch", "--show-current"]).trim();
+}
+
+function gitBaseRef(cwd) {
+  const configured = process.env.CODEX_HANDOFF_REVIEW_BASE_REF;
+  if (configured) {
+    return configured;
+  }
+  const branch = gitCurrentBranch(cwd);
+  return branch && branch !== "master" ? "origin/master" : "";
+}
+
 function currentChangedFiles(cwd) {
   const output = gitOutput(cwd, ["status", "--porcelain"]);
   return output
@@ -119,6 +133,17 @@ function currentChangedFiles(cwd) {
     .filter(Boolean)
     .map((line) => line.slice(3).replace(/^.* -> /, ""))
     .filter(Boolean);
+}
+
+function currentDiff(cwd) {
+  return gitOutput(cwd, ["diff", "--no-ext-diff"]);
+}
+
+function branchDiffStat(cwd, baseRef) {
+  if (!baseRef) {
+    return "";
+  }
+  return gitOutput(cwd, ["diff", "--stat", `${baseRef}...HEAD`]);
 }
 
 function contentToText(content) {
@@ -214,6 +239,21 @@ function readOptionalBrief(cwd) {
 
 function dataRoot() {
   return process.env.CLAUDE_PLUGIN_DATA || path.join(os.tmpdir(), "codex-handoff-review");
+}
+
+function cleanupHistory(root) {
+  const limit = envNumber("CODEX_HANDOFF_REVIEW_HISTORY_LIMIT", DEFAULT_HISTORY_LIMIT);
+  const entries = fs.readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && /^\d{4}-.*\.md$/.test(entry.name))
+    .map((entry) => {
+      const fullPath = path.join(root, entry.name);
+      return { fullPath, mtimeMs: fs.statSync(fullPath).mtimeMs };
+    })
+    .sort((left, right) => right.mtimeMs - left.mtimeMs);
+
+  for (const entry of entries.slice(limit)) {
+    fs.rmSync(entry.fullPath, { force: true });
+  }
 }
 
 function sessionKey(sessionId) {
@@ -313,6 +353,22 @@ function autoBrief({ hookInput, transcript, brief, baseline, changedFiles, track
   ].join("\n");
 }
 
+function reviewMetadata({ cwd, rawOutput, outputPath, baseline, tracker, changedFiles, baseRef }) {
+  const firstLine = firstMeaningfulLine(rawOutput);
+  const decision = firstLine.startsWith("BLOCK:") ? "block" : firstLine.startsWith("ALLOW:") ? "allow" : "unknown";
+  return {
+    decision,
+    firstLine,
+    workspace: cwd,
+    outputPath,
+    generatedAt: new Date().toISOString(),
+    baseRef: baseRef || null,
+    hasBaseline: Boolean(baseline),
+    trackedFiles: tracker?.touchedFiles || [],
+    changedFiles
+  };
+}
+
 function scanSecrets(label, text) {
   const findings = [];
   const value = String(text || "");
@@ -325,7 +381,7 @@ function scanSecrets(label, text) {
   return findings;
 }
 
-function secretScanFindings({ transcript, brief, lastAssistantMessage }) {
+function secretScanFindings({ transcript, brief, lastAssistantMessage, diff }) {
   if (!envFlag("CODEX_HANDOFF_REVIEW_SECRET_SCAN", true)) {
     return [];
   }
@@ -333,11 +389,12 @@ function secretScanFindings({ transcript, brief, lastAssistantMessage }) {
   return [
     ...scanSecrets("transcript", transcript),
     ...scanSecrets("last assistant message", lastAssistantMessage),
-    ...(brief ? scanSecrets(`brief ${brief.path}`, brief.text) : [])
+    ...(brief ? scanSecrets(`brief ${brief.path}`, brief.text) : []),
+    ...scanSecrets("current git diff", diff)
   ];
 }
 
-function buildPrompt({ cwd, hookInput, transcript, brief, baseline, changedFiles, tracker, generatedBrief, failOnMissingContext, skillText }) {
+function buildPrompt({ cwd, hookInput, transcript, brief, baseline, changedFiles, tracker, generatedBrief, baseRef, branchStat, failOnMissingContext, skillText }) {
   const lastAssistantMessage = String(hookInput.last_assistant_message ?? "").trim();
   const briefBlock = brief ? `Brief file (${brief.path}):\n${brief.text}` : "No review brief file found.";
   const transcriptBlock = transcript || "No recent transcript text recovered.";
@@ -356,6 +413,7 @@ Gate protocol:
 - Inspect the current Git working tree in: ${cwd}
 - Review the actual diff and relevant call chain.
 - Prefer files recorded by Claude file-tool tracking when deciding the session's primary review target.
+- If a base ref is present, use it as branch/PR context, not as a replacement for working-tree review.
 - If a SessionStart baseline is present, prioritize changes made after that baseline; pre-existing dirty-worktree changes are context unless they directly affect the session delta.
 - Use the brief/transcript as intent context, but trust code facts over prose.
 - Do not modify files.
@@ -376,6 +434,12 @@ Session baseline:
 
 ${baselineText}
 
+Branch/PR context:
+
+Base ref: ${baseRef || "not configured"}
+Branch diff --stat:
+${branchStat || "No branch diff stat available."}
+
 Claude file-tool tracked files:
 
 ${trackedFilesText}
@@ -395,14 +459,22 @@ ${lastAssistantBlock}
 }
 
 function writeReviewOutput(cwd, rawOutput) {
-  const dataRoot = process.env.CLAUDE_PLUGIN_DATA || path.join(os.tmpdir(), "codex-handoff-review");
-  fs.mkdirSync(dataRoot, { recursive: true });
+  const dataRootPath = dataRoot();
+  fs.mkdirSync(dataRootPath, { recursive: true });
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const latestPath = path.join(dataRoot, "latest-review.md");
-  const timestampPath = path.join(dataRoot, `${timestamp}.md`);
+  const latestPath = path.join(dataRootPath, "latest-review.md");
+  const timestampPath = path.join(dataRootPath, `${timestamp}.md`);
   const body = [`# Codex Handoff Review`, ``, `Workspace: ${cwd}`, ``, rawOutput].join("\n");
   fs.writeFileSync(latestPath, body, "utf8");
   fs.writeFileSync(timestampPath, body, "utf8");
+  cleanupHistory(dataRootPath);
+  return latestPath;
+}
+
+function writeReviewMetadata(metadata) {
+  const root = dataRoot();
+  const latestPath = path.join(root, "latest-review.json");
+  fs.writeFileSync(latestPath, JSON.stringify(metadata, null, 2), "utf8");
   return latestPath;
 }
 
@@ -465,7 +537,8 @@ function main() {
   const transcript = readRecentTranscript(hookInput.transcript_path, maxTranscriptChars);
   const brief = readOptionalBrief(cwd);
   const lastAssistantMessage = String(hookInput.last_assistant_message ?? "").trim();
-  if (handleSecretFindings(secretScanFindings({ transcript, brief, lastAssistantMessage }))) {
+  const diff = currentDiff(cwd);
+  if (handleSecretFindings(secretScanFindings({ transcript, brief, lastAssistantMessage, diff }))) {
     return;
   }
 
@@ -473,9 +546,11 @@ function main() {
   const baseline = readSessionBaseline(hookInput, cwd);
   const tracker = readSessionTracker(hookInput);
   const changedFiles = currentChangedFiles(cwd);
+  const baseRef = gitBaseRef(cwd);
+  const branchStat = branchDiffStat(cwd, baseRef);
   const generatedBrief = autoBrief({ hookInput, transcript, brief, baseline, changedFiles, tracker });
   const failOnMissingContext = envFlag("CODEX_HANDOFF_REVIEW_FAIL_ON_MISSING_CONTEXT", true);
-  const prompt = buildPrompt({ cwd, hookInput, transcript, brief, baseline, changedFiles, tracker, generatedBrief, failOnMissingContext, skillText });
+  const prompt = buildPrompt({ cwd, hookInput, transcript, brief, baseline, changedFiles, tracker, generatedBrief, baseRef, branchStat, failOnMissingContext, skillText });
 
   if (process.env.CODEX_HANDOFF_REVIEW_DRY_RUN === "1") {
     process.stdout.write(JSON.stringify({
@@ -485,6 +560,7 @@ function main() {
       hasBrief: Boolean(brief),
       hasBaseline: Boolean(baseline),
       hasToolTracker: Boolean(tracker),
+      baseRef: baseRef || null,
       changedFiles,
       trackedFiles: tracker?.touchedFiles || [],
       failOnMissingContext,
@@ -506,6 +582,8 @@ function main() {
 
   const rawOutput = `${result.stdout || ""}${result.stderr ? `\n\nSTDERR:\n${result.stderr}` : ""}`.trim();
   const outputPath = writeReviewOutput(cwd, rawOutput);
+  const metadata = reviewMetadata({ cwd, rawOutput, outputPath, baseline, tracker, changedFiles, baseRef });
+  writeReviewMetadata(metadata);
 
   if (result.status !== 0) {
     handleGateFailure("CODEX_ERROR", `Codex handoff review failed. Latest output: ${outputPath}\n${trimForReason(rawOutput)}`);

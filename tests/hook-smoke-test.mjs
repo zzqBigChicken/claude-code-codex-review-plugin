@@ -111,6 +111,48 @@ function runPostToolUse(repo, dataDir, filePath = path.join(repo, "feature.txt")
   });
 }
 
+function runNotebookToolUse(repo, dataDir, filePath = path.join(repo, "notes.ipynb")) {
+  const input = JSON.stringify({
+    cwd: repo,
+    session_id: "test-session",
+    tool_name: "NotebookEdit",
+    tool_input: {
+      notebook_path: filePath
+    }
+  });
+
+  return run("node", [POST_TOOL_USE_SCRIPT], {
+    input,
+    cwd: REPO_ROOT,
+    env: {
+      ...process.env,
+      CLAUDE_PLUGIN_DATA: dataDir
+    },
+    check: false
+  });
+}
+
+function runBashToolUse(repo, dataDir) {
+  const input = JSON.stringify({
+    cwd: repo,
+    session_id: "test-session",
+    tool_name: "Bash",
+    tool_input: {
+      command: "mock command"
+    }
+  });
+
+  return run("node", [POST_TOOL_USE_SCRIPT], {
+    input,
+    cwd: REPO_ROOT,
+    env: {
+      ...process.env,
+      CLAUDE_PLUGIN_DATA: dataDir
+    },
+    check: false
+  });
+}
+
 function assert(condition, message) {
   if (!condition) {
     throw new Error(message);
@@ -135,6 +177,12 @@ try {
   assert(postToolUseResult.status === 0, "PostToolUse tracker run should exit 0");
   assert(fs.existsSync(path.join(dataDir, "sessions", "test-session.json")), "PostToolUse should write a session tracker file");
 
+  const notebookResult = runNotebookToolUse(repo, dataDir);
+  assert(notebookResult.status === 0, "NotebookEdit tracker run should exit 0");
+
+  const bashResult = runBashToolUse(repo, dataDir);
+  assert(bashResult.status === 0, "Bash tracker run should exit 0");
+
   const dryRunResult = runHook(repo, {
     ...envBase,
     CODEX_HANDOFF_REVIEW_DRY_RUN: "1",
@@ -152,6 +200,7 @@ try {
   assert(allowResult.status === 0, "ALLOW run should exit 0");
   assert(!allowResult.stdout.includes('"decision":"block"'), "ALLOW run should not block");
   assert(fs.existsSync(path.join(dataDir, "latest-review.md")), "ALLOW run should write latest review output");
+  assert(fs.existsSync(path.join(dataDir, "latest-review.json")), "ALLOW run should write latest review metadata");
 
   const blockResult = runHook(repo, {
     ...envBase,
@@ -175,6 +224,11 @@ try {
   assert(secretResult.status === 0, "secret scan run should exit 0");
   assert(secretResult.stdout.includes('"decision":"block"'), "secret scan should block before Codex runs");
   assert(secretResult.stdout.includes("possible secrets"), "secret scan should explain the block");
+
+  fs.writeFileSync(path.join(repo, "secret.txt"), "api_key = \"super-secret-value\"\n", "utf8");
+  const diffSecretResult = runHook(repo, envBase);
+  assert(diffSecretResult.status === 0, "diff secret scan run should exit 0");
+  assert(diffSecretResult.stdout.includes('"decision":"block"'), "diff secret scan should block before Codex runs");
 
   const cleanRepo = createCleanRepo(tempRoot);
   const cleanResult = runHook(cleanRepo, envBase);

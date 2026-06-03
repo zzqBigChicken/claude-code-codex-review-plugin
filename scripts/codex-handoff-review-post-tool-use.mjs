@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { spawnSync } from "node:child_process";
 
 function readStdinJson() {
   const raw = fs.readFileSync(0, "utf8").trim();
@@ -34,7 +35,27 @@ function toolInput(input) {
 
 function filePathFromTool(input) {
   const payload = toolInput(input);
-  return payload.file_path || payload.filePath || payload.path || "";
+  return payload.file_path || payload.filePath || payload.notebook_path || payload.notebookPath || payload.path || "";
+}
+
+function runGit(cwd, args) {
+  const result = spawnSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    timeout: 30000,
+    maxBuffer: 10 * 1024 * 1024
+  });
+  return result.status === 0 ? result.stdout || "" : "";
+}
+
+function gitChangedFiles(cwd) {
+  return runGit(cwd, ["status", "--porcelain"])
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+$/, ""))
+    .filter(Boolean)
+    .map((line) => line.slice(3).replace(/^.* -> /, ""))
+    .filter(Boolean)
+    .map((file) => path.resolve(cwd, file));
 }
 
 function readTracker(sessionId) {
@@ -55,22 +76,23 @@ function main() {
   const sessionId = hookInput.session_id || process.env.CLAUDE_CODE_SESSION_ID || "default";
   const cwd = hookInput.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const filePath = filePathFromTool(hookInput);
-  if (!filePath) {
+  const tool = toolName(hookInput);
+  const files = filePath ? [path.resolve(cwd, filePath)] : tool === "Bash" ? gitChangedFiles(cwd) : [];
+  if (!files.length) {
     return;
   }
 
-  const resolvedPath = path.resolve(cwd, filePath);
   const tracker = readTracker(sessionId);
-  const event = {
-    tool: toolName(hookInput),
+  const events = files.map((resolvedPath) => ({
+    tool,
     filePath: resolvedPath,
     cwd,
     recordedAt: new Date().toISOString()
-  };
+  }));
 
-  tracker.updatedAt = event.recordedAt;
-  tracker.touchedFiles = Array.from(new Set([...(tracker.touchedFiles || []), resolvedPath]));
-  tracker.toolEvents = [...(tracker.toolEvents || []), event].slice(-200);
+  tracker.updatedAt = events.at(-1).recordedAt;
+  tracker.touchedFiles = Array.from(new Set([...(tracker.touchedFiles || []), ...files]));
+  tracker.toolEvents = [...(tracker.toolEvents || []), ...events].slice(-200);
 
   fs.mkdirSync(path.dirname(trackerPath(sessionId)), { recursive: true });
   fs.writeFileSync(trackerPath(sessionId), JSON.stringify(tracker, null, 2), "utf8");
