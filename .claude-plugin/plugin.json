@@ -1,9 +1,9 @@
 {
   "name": "codex-handoff-review",
-  "displayName": "Codex Handoff Review",
+  "displayName": "Claude Code Codex Review",
   "version": "0.2.0",
-  "description": "Automatically runs a Codex stop-time review gate for Claude Code changes using recent transcript context and repository diff.",
-  "repository": "https://github.com/zzqBigChicken/codex-handoff-review-skill",
+  "description": "Claude Code plugin that automatically runs a Codex review gate after AI-generated code changes.",
+  "repository": "https://github.com/zzqBigChicken/claude-code-codex-review-plugin",
   "author": {
     "name": "zzqBigChicken"
   }

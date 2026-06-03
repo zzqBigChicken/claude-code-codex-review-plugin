@@ -1,8 +1,8 @@
-# Codex Handoff Review Plugin
+# Claude Code Codex Review Plugin
 
-Automatically run a Codex review gate when Claude Code finishes a turn after code changes.
+Claude Code plugin that automatically runs a Codex review gate after AI-generated code changes.
 
-This plugin exists for one problem: Claude can write code from a long conversation, but Codex only sees the repository unless the context is handed over. The plugin wires that handoff into Claude Code's `Stop` hook.
+This plugin exists for one problem: Claude Code can write code from a long conversation, but Codex only sees the repository unless the context is handed over. The plugin wires that handoff into Claude Code's `Stop` hook and asks Codex to review the final diff before Claude stops.
 
 ## What It Does
 
@@ -41,12 +41,11 @@ skills/codex-handoff-review/references/claude-handoff-instruction.md
 Clone this repository, then install it as a Claude Code plugin from the local path.
 
 ```powershell
-git clone https://github.com/zzqBigChicken/codex-handoff-review-skill.git
-cd codex-handoff-review-skill
-claude --plugin-dir .
+git clone https://github.com/zzqBigChicken/claude-code-codex-review-plugin.git
+cd claude-code-codex-review-plugin
+claude plugin marketplace add . --scope user
+claude plugin install codex-handoff-review@codex-handoff-review --scope user
 ```
-
-If you use Claude Code's plugin marketplace flow, add this repository as a plugin source and install `codex-handoff-review`.
 
 After enabling the plugin, restart or reload Claude Code so hooks are picked up.
 
