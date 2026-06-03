@@ -14,14 +14,32 @@ const DEFAULT_MAX_CODEX_OUTPUT_CHARS = 8000;
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_FAIL_MODE = "block";
 const DEFAULT_MAX_BASELINE_CHARS = 50000;
+const DEFAULT_MAX_CHANGED_FILES = 80;
+const SECRET_PATTERNS = [
+  { name: "GitHub token", pattern: /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}\b/g },
+  { name: "GitHub fine-grained token", pattern: /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g },
+  { name: "OpenAI API key", pattern: /\bsk-[A-Za-z0-9_-]{20,}\b/g },
+  { name: "Private key", pattern: /-----BEGIN (?:RSA |OPENSSH |EC |DSA |)?PRIVATE KEY-----/g },
+  { name: "Password assignment", pattern: /\b(?:password|passwd|pwd)\b\s*[:=]\s*["']?[^"'\s]{8,}/gi },
+  { name: "API key assignment", pattern: /\b(?:api[_-]?key|secret[_-]?key|access[_-]?key|client[_-]?secret)\b\s*[:=]\s*["']?[^"'\s]{12,}/gi }
+];
 
-function envFlag(name) {
-  return ["1", "true", "yes", "on"].includes(String(process.env[name] || "").toLowerCase());
+function envFlag(name, fallback = false) {
+  const value = process.env[name];
+  if (value === undefined) {
+    return fallback;
+  }
+  return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
 }
 
 function envChoice(name, allowed, fallback) {
   const value = String(process.env[name] || "").toLowerCase();
   return allowed.includes(value) ? value : fallback;
+}
+
+function envNumber(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
 function readStdinJson() {
@@ -82,6 +100,24 @@ function hasGitChanges(cwd) {
     throw new Error(`Unable to read git status: ${status.stderr || status.stdout}`);
   }
   return status.stdout.trim().length > 0;
+}
+
+function gitOutput(cwd, args) {
+  const result = run("git", args, cwd);
+  if (result.status !== 0) {
+    return "";
+  }
+  return result.stdout || "";
+}
+
+function currentChangedFiles(cwd) {
+  const output = gitOutput(cwd, ["status", "--porcelain"]);
+  return output
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+$/, ""))
+    .filter(Boolean)
+    .map((line) => line.slice(3).replace(/^.* -> /, ""))
+    .filter(Boolean);
 }
 
 function contentToText(content) {
@@ -179,9 +215,13 @@ function dataRoot() {
   return process.env.CLAUDE_PLUGIN_DATA || path.join(os.tmpdir(), "codex-handoff-review");
 }
 
+function sessionKey(sessionId) {
+  return String(sessionId || "default").replace(/[^a-zA-Z0-9._-]/g, "_");
+}
+
 function readSessionBaseline(hookInput, cwd) {
   const sessionId = hookInput.session_id || process.env.CLAUDE_CODE_SESSION_ID || "default";
-  const fullPath = path.join(dataRoot(), "baselines", `${sessionId}.json`);
+  const fullPath = path.join(dataRoot(), "baselines", `${sessionKey(sessionId)}.json`);
   if (!fs.existsSync(fullPath)) {
     return null;
   }
@@ -211,16 +251,54 @@ ${trimBlock(baseline.status, maxChars)}
 Baseline git diff --stat:
 ${trimBlock(baseline.diffStat, maxChars)}
 
+Baseline git diff --name-status:
+${trimBlock(baseline.nameStatus, maxChars)}
+
 Baseline git diff:
 ${trimBlock(baseline.diff, maxChars)}`;
 }
 
-function buildPrompt({ cwd, hookInput, transcript, brief, baseline, skillText }) {
+function changedFilesBlock(files) {
+  if (!files.length) {
+    return "No changed files detected.";
+  }
+  const maxFiles = envNumber("CODEX_HANDOFF_REVIEW_MAX_CHANGED_FILES", DEFAULT_MAX_CHANGED_FILES);
+  const visible = files.slice(0, maxFiles);
+  const suffix = files.length > visible.length ? `\n...and ${files.length - visible.length} more file(s).` : "";
+  return visible.map((file) => `- ${file}`).join("\n") + suffix;
+}
+
+function scanSecrets(label, text) {
+  const findings = [];
+  const value = String(text || "");
+  for (const rule of SECRET_PATTERNS) {
+    const matches = value.match(rule.pattern);
+    if (matches?.length) {
+      findings.push(`${label}: ${rule.name}`);
+    }
+  }
+  return findings;
+}
+
+function secretScanFindings({ transcript, brief, lastAssistantMessage }) {
+  if (!envFlag("CODEX_HANDOFF_REVIEW_SECRET_SCAN", true)) {
+    return [];
+  }
+
+  return [
+    ...scanSecrets("transcript", transcript),
+    ...scanSecrets("last assistant message", lastAssistantMessage),
+    ...(brief ? scanSecrets(`brief ${brief.path}`, brief.text) : [])
+  ];
+}
+
+function buildPrompt({ cwd, hookInput, transcript, brief, baseline, changedFiles, failOnMissingContext, skillText }) {
   const lastAssistantMessage = String(hookInput.last_assistant_message ?? "").trim();
   const briefBlock = brief ? `Brief file (${brief.path}):\n${brief.text}` : "No review brief file found.";
   const transcriptBlock = transcript || "No recent transcript text recovered.";
   const lastAssistantBlock = lastAssistantMessage || "No last assistant message provided by hook input.";
   const baselineText = baselineBlock(baseline);
+  const changedFilesText = changedFilesBlock(changedFiles);
 
   return `You are running as a read-only Codex review gate for Claude Code.
 
@@ -235,9 +313,9 @@ Gate protocol:
 - Use the brief/transcript as intent context, but trust code facts over prose.
 - Do not modify files.
 - If there are BLOCKER or HIGH findings, start the final answer with exactly "BLOCK:".
-- If Codex cannot determine business-logic compliance because context is missing for a meaningful code change, start with exactly "BLOCK:" and explain the missing context.
+- Missing-context policy: ${failOnMissingContext ? "BLOCK when business-logic compliance cannot be determined for a meaningful code change." : "ALLOW with a VERIFICATION-GAP when business-logic compliance cannot be determined solely because context is missing."}
 - Otherwise start the final answer with exactly "ALLOW:".
-- After the prefix, include concise findings and verification gaps.
+- After the prefix, use these sections: Findings, Context Coverage, Validation, Changed Files.
 
 Handoff context:
 
@@ -246,6 +324,10 @@ ${briefBlock}
 Session baseline:
 
 ${baselineText}
+
+Changed files:
+
+${changedFilesText}
 
 Recent Claude transcript excerpt:
 
@@ -283,6 +365,16 @@ function handleGateFailure(kind, reason) {
   emitBlock(reason);
 }
 
+function handleSecretFindings(findings) {
+  if (!findings.length) {
+    return false;
+  }
+
+  const reason = `Codex handoff review stopped before sending context to Codex because possible secrets were found:\n${[...new Set(findings)].map((finding) => `- ${finding}`).join("\n")}\nRemove the secret from the prompt/brief or set CODEX_HANDOFF_REVIEW_ON_SECRET=allow if this is a false positive.`;
+  handleGateFailure("SECRET", reason);
+  return true;
+}
+
 function firstMeaningfulLine(text) {
   return String(text || "")
     .split(/\r?\n/)
@@ -315,11 +407,18 @@ function main() {
     return;
   }
 
-  const skillText = fs.readFileSync(SKILL_PATH, "utf8");
   const transcript = readRecentTranscript(hookInput.transcript_path, maxTranscriptChars);
   const brief = readOptionalBrief(cwd);
+  const lastAssistantMessage = String(hookInput.last_assistant_message ?? "").trim();
+  if (handleSecretFindings(secretScanFindings({ transcript, brief, lastAssistantMessage }))) {
+    return;
+  }
+
+  const skillText = fs.readFileSync(SKILL_PATH, "utf8");
   const baseline = readSessionBaseline(hookInput, cwd);
-  const prompt = buildPrompt({ cwd, hookInput, transcript, brief, baseline, skillText });
+  const changedFiles = currentChangedFiles(cwd);
+  const failOnMissingContext = envFlag("CODEX_HANDOFF_REVIEW_FAIL_ON_MISSING_CONTEXT", true);
+  const prompt = buildPrompt({ cwd, hookInput, transcript, brief, baseline, changedFiles, failOnMissingContext, skillText });
 
   if (process.env.CODEX_HANDOFF_REVIEW_DRY_RUN === "1") {
     process.stdout.write(JSON.stringify({
@@ -328,6 +427,8 @@ function main() {
       hasTranscript: Boolean(transcript),
       hasBrief: Boolean(brief),
       hasBaseline: Boolean(baseline),
+      changedFiles,
+      failOnMissingContext,
       promptChars: prompt.length
     }, null, 2));
     process.stdout.write("\n");

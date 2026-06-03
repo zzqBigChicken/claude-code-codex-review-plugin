@@ -41,12 +41,24 @@ function createChangedRepo(tempRoot) {
   return repo;
 }
 
+function createCleanRepo(tempRoot) {
+  const repo = path.join(tempRoot, "clean-repo");
+  fs.mkdirSync(repo, { recursive: true });
+  run("git", ["init"], { cwd: repo });
+  run("git", ["config", "user.email", "test@example.com"], { cwd: repo });
+  run("git", ["config", "user.name", "Test User"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "feature.txt"), "clean\n", "utf8");
+  run("git", ["add", "feature.txt"], { cwd: repo });
+  run("git", ["commit", "-m", "seed"], { cwd: repo });
+  return repo;
+}
+
 function runHook(repo, envOverrides = {}) {
   const input = JSON.stringify({
     cwd: repo,
     session_id: "test-session",
     transcript_path: "",
-    last_assistant_message: "Implemented a sample change."
+    last_assistant_message: envOverrides.LAST_ASSISTANT_MESSAGE || "Implemented a sample change."
   });
 
   return run("node", [HOOK_SCRIPT], {
@@ -54,7 +66,7 @@ function runHook(repo, envOverrides = {}) {
     cwd: REPO_ROOT,
     env: {
       ...process.env,
-      ...envOverrides
+      ...Object.fromEntries(Object.entries(envOverrides).filter(([key]) => key !== "LAST_ASSISTANT_MESSAGE"))
     },
     check: false
   });
@@ -104,6 +116,7 @@ try {
   });
   assert(dryRunResult.status === 0, "dry run should exit 0");
   assert(dryRunResult.stdout.includes('"hasBaseline": true'), "dry run should detect the SessionStart baseline");
+  assert(dryRunResult.stdout.includes('"feature.txt"'), "dry run should include changed files");
 
   const allowResult = runHook(repo, {
     ...envBase,
@@ -127,6 +140,34 @@ try {
   });
   assert(missingCodex.status === 0, "fail-open missing Codex run should exit 0");
   assert(!missingCodex.stdout.includes('"decision":"block"'), "fail-open missing Codex should not block");
+
+  const secretResult = runHook(repo, {
+    ...envBase,
+    LAST_ASSISTANT_MESSAGE: "password = \"super-secret-value\""
+  });
+  assert(secretResult.status === 0, "secret scan run should exit 0");
+  assert(secretResult.stdout.includes('"decision":"block"'), "secret scan should block before Codex runs");
+  assert(secretResult.stdout.includes("possible secrets"), "secret scan should explain the block");
+
+  const cleanRepo = createCleanRepo(tempRoot);
+  const cleanResult = runHook(cleanRepo, envBase);
+  assert(cleanResult.status === 0, "clean repo run should exit 0");
+  assert(cleanResult.stdout.trim() === "", "clean repo run should not emit a hook decision");
+
+  const mismatchedBaselineDir = path.join(tempRoot, "mismatch-data");
+  fs.mkdirSync(path.join(mismatchedBaselineDir, "baselines"), { recursive: true });
+  fs.writeFileSync(path.join(mismatchedBaselineDir, "baselines", "test-session.json"), JSON.stringify({
+    sessionId: "test-session",
+    cwd: path.join(tempRoot, "other-repo"),
+    capturedAt: new Date().toISOString()
+  }), "utf8");
+  const mismatchedBaseline = runHook(repo, {
+    ...envBase,
+    CLAUDE_PLUGIN_DATA: mismatchedBaselineDir,
+    CODEX_HANDOFF_REVIEW_DRY_RUN: "1"
+  });
+  assert(mismatchedBaseline.status === 0, "mismatched baseline dry run should exit 0");
+  assert(mismatchedBaseline.stdout.includes('"hasBaseline": false'), "mismatched baseline should be ignored");
 
   console.log("hook smoke tests passed");
 } finally {

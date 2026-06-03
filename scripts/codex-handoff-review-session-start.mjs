@@ -33,8 +33,12 @@ function dataRoot() {
   return process.env.CLAUDE_PLUGIN_DATA || path.join(os.tmpdir(), "codex-handoff-review");
 }
 
+function sessionKey(sessionId) {
+  return String(sessionId || "default").replace(/[^a-zA-Z0-9._-]/g, "_");
+}
+
 function baselinePath(sessionId) {
-  return path.join(dataRoot(), "baselines", `${sessionId || "default"}.json`);
+  return path.join(dataRoot(), "baselines", `${sessionKey(sessionId)}.json`);
 }
 
 function trimText(text, maxChars) {
@@ -54,6 +58,7 @@ function main() {
   const status = run("git", ["status", "--porcelain"], cwd);
   const diffStat = run("git", ["diff", "--stat"], cwd);
   const diff = run("git", ["diff", "--no-ext-diff"], cwd);
+  const nameStatus = run("git", ["diff", "--name-status", "HEAD", "--"], cwd);
   const maxDiffChars = Number(process.env.CODEX_HANDOFF_REVIEW_MAX_BASELINE_DIFF_CHARS || DEFAULT_MAX_BASELINE_DIFF_CHARS);
 
   const baseline = {
@@ -62,6 +67,7 @@ function main() {
     capturedAt: new Date().toISOString(),
     status: status.stdout || "",
     diffStat: diffStat.stdout || "",
+    nameStatus: nameStatus.stdout || "",
     diff: trimText(diff.stdout || "", maxDiffChars)
   };
 
