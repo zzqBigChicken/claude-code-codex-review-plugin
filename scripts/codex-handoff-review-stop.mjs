@@ -12,6 +12,17 @@ const SKILL_PATH = path.join(PLUGIN_ROOT, "skills", "codex-handoff-review", "SKI
 const DEFAULT_MAX_TRANSCRIPT_CHARS = 20000;
 const DEFAULT_MAX_CODEX_OUTPUT_CHARS = 8000;
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
+const DEFAULT_FAIL_MODE = "block";
+const DEFAULT_MAX_BASELINE_CHARS = 50000;
+
+function envFlag(name) {
+  return ["1", "true", "yes", "on"].includes(String(process.env[name] || "").toLowerCase());
+}
+
+function envChoice(name, allowed, fallback) {
+  const value = String(process.env[name] || "").toLowerCase();
+  return allowed.includes(value) ? value : fallback;
+}
 
 function readStdinJson() {
   const raw = fs.readFileSync(0, "utf8").trim();
@@ -22,10 +33,32 @@ function readStdinJson() {
 }
 
 function commandExists(command, cwd) {
+  if (path.isAbsolute(command)) {
+    return fs.existsSync(command);
+  }
   const checker = process.platform === "win32" ? "where" : "command";
   const args = process.platform === "win32" ? [command] : ["-v", command];
   const result = spawnSync(checker, args, { cwd, encoding: "utf8", shell: process.platform !== "win32" });
   return result.status === 0;
+}
+
+function jsonArrayEnv(name) {
+  const value = process.env[name];
+  if (!value) {
+    return [];
+  }
+  const parsed = JSON.parse(value);
+  if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== "string")) {
+    throw new Error(`${name} must be a JSON array of strings.`);
+  }
+  return parsed;
+}
+
+function codexInvocation() {
+  return {
+    command: process.env.CODEX_HANDOFF_REVIEW_CODEX_COMMAND || "codex",
+    prefixArgs: jsonArrayEnv("CODEX_HANDOFF_REVIEW_CODEX_ARGS")
+  };
 }
 
 function run(command, args, cwd, options = {}) {
@@ -142,11 +175,52 @@ function readOptionalBrief(cwd) {
   return null;
 }
 
-function buildPrompt({ cwd, hookInput, transcript, brief, skillText }) {
+function dataRoot() {
+  return process.env.CLAUDE_PLUGIN_DATA || path.join(os.tmpdir(), "codex-handoff-review");
+}
+
+function readSessionBaseline(hookInput, cwd) {
+  const sessionId = hookInput.session_id || process.env.CLAUDE_CODE_SESSION_ID || "default";
+  const fullPath = path.join(dataRoot(), "baselines", `${sessionId}.json`);
+  if (!fs.existsSync(fullPath)) {
+    return null;
+  }
+
+  const baseline = JSON.parse(fs.readFileSync(fullPath, "utf8"));
+  return baseline.cwd === cwd ? baseline : null;
+}
+
+function trimBlock(text, maxChars) {
+  const value = String(text || "").trim();
+  return value.length > maxChars ? `${value.slice(0, maxChars)}\n...[truncated]` : value;
+}
+
+function baselineBlock(baseline) {
+  if (!baseline) {
+    return "No SessionStart baseline was found. Review the current Git working tree diff.";
+  }
+
+  const maxChars = Number(process.env.CODEX_HANDOFF_REVIEW_MAX_BASELINE_CHARS || DEFAULT_MAX_BASELINE_CHARS);
+  return `SessionStart baseline captured at ${baseline.capturedAt}.
+
+Use this baseline to separate pre-existing dirty-worktree changes from changes made during the current Claude Code session. Review the session delta first. If the delta cannot be isolated reliably, say so and review the full current working tree as a fallback.
+
+Baseline git status:
+${trimBlock(baseline.status, maxChars)}
+
+Baseline git diff --stat:
+${trimBlock(baseline.diffStat, maxChars)}
+
+Baseline git diff:
+${trimBlock(baseline.diff, maxChars)}`;
+}
+
+function buildPrompt({ cwd, hookInput, transcript, brief, baseline, skillText }) {
   const lastAssistantMessage = String(hookInput.last_assistant_message ?? "").trim();
   const briefBlock = brief ? `Brief file (${brief.path}):\n${brief.text}` : "No review brief file found.";
   const transcriptBlock = transcript || "No recent transcript text recovered.";
   const lastAssistantBlock = lastAssistantMessage || "No last assistant message provided by hook input.";
+  const baselineText = baselineBlock(baseline);
 
   return `You are running as a read-only Codex review gate for Claude Code.
 
@@ -157,6 +231,7 @@ ${skillText}
 Gate protocol:
 - Inspect the current Git working tree in: ${cwd}
 - Review the actual diff and relevant call chain.
+- If a SessionStart baseline is present, prioritize changes made after that baseline; pre-existing dirty-worktree changes are context unless they directly affect the session delta.
 - Use the brief/transcript as intent context, but trust code facts over prose.
 - Do not modify files.
 - If there are BLOCKER or HIGH findings, start the final answer with exactly "BLOCK:".
@@ -167,6 +242,10 @@ Gate protocol:
 Handoff context:
 
 ${briefBlock}
+
+Session baseline:
+
+${baselineText}
 
 Recent Claude transcript excerpt:
 
@@ -194,6 +273,16 @@ function emitBlock(reason) {
   process.stdout.write(`${JSON.stringify({ decision: "block", reason })}\n`);
 }
 
+function handleGateFailure(kind, reason) {
+  const globalMode = envChoice("CODEX_HANDOFF_REVIEW_FAIL_MODE", ["block", "allow"], DEFAULT_FAIL_MODE);
+  const mode = envChoice(`CODEX_HANDOFF_REVIEW_ON_${kind}`, ["block", "allow"], globalMode);
+  if (mode === "allow") {
+    process.stderr.write(`Codex handoff review ${kind.toLowerCase()} allowed by configuration: ${reason}\n`);
+    return;
+  }
+  emitBlock(reason);
+}
+
 function firstMeaningfulLine(text) {
   return String(text || "")
     .split(/\r?\n/)
@@ -212,19 +301,25 @@ function main() {
   const cwd = hookInput.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const maxTranscriptChars = Number(process.env.CODEX_HANDOFF_REVIEW_MAX_TRANSCRIPT_CHARS || DEFAULT_MAX_TRANSCRIPT_CHARS);
 
+  if (envFlag("CODEX_HANDOFF_REVIEW_SKIP")) {
+    return;
+  }
+
   if (!isGitWorkTree(cwd) || !hasGitChanges(cwd)) {
     return;
   }
 
-  if (!commandExists("codex", cwd)) {
-    emitBlock("Codex handoff review could not run because `codex` was not found on PATH. Install/login to Codex or disable the plugin hook.");
+  const codex = codexInvocation();
+  if (!commandExists(codex.command, cwd)) {
+    handleGateFailure("CODEX_UNAVAILABLE", "Codex handoff review could not run because `codex` was not found on PATH. Install/login to Codex or disable the plugin hook.");
     return;
   }
 
   const skillText = fs.readFileSync(SKILL_PATH, "utf8");
   const transcript = readRecentTranscript(hookInput.transcript_path, maxTranscriptChars);
   const brief = readOptionalBrief(cwd);
-  const prompt = buildPrompt({ cwd, hookInput, transcript, brief, skillText });
+  const baseline = readSessionBaseline(hookInput, cwd);
+  const prompt = buildPrompt({ cwd, hookInput, transcript, brief, baseline, skillText });
 
   if (process.env.CODEX_HANDOFF_REVIEW_DRY_RUN === "1") {
     process.stdout.write(JSON.stringify({
@@ -232,19 +327,20 @@ function main() {
       cwd,
       hasTranscript: Boolean(transcript),
       hasBrief: Boolean(brief),
+      hasBaseline: Boolean(baseline),
       promptChars: prompt.length
     }, null, 2));
     process.stdout.write("\n");
     return;
   }
 
-  const result = run("codex", ["exec", "--cd", cwd, "--sandbox", "read-only", "-"], cwd, {
+  const result = run(codex.command, [...codex.prefixArgs, "exec", "--cd", cwd, "--sandbox", "read-only", "-"], cwd, {
     input: prompt,
     timeout: Number(process.env.CODEX_HANDOFF_REVIEW_TIMEOUT_MS || DEFAULT_TIMEOUT_MS)
   });
 
   if (result.error?.code === "ETIMEDOUT") {
-    emitBlock("Codex handoff review timed out. Run the review manually or fix the timeout before ending.");
+    handleGateFailure("TIMEOUT", "Codex handoff review timed out. Run the review manually or fix the timeout before ending.");
     return;
   }
 
@@ -252,7 +348,7 @@ function main() {
   const outputPath = writeReviewOutput(cwd, rawOutput);
 
   if (result.status !== 0) {
-    emitBlock(`Codex handoff review failed. Latest output: ${outputPath}\n${trimForReason(rawOutput)}`);
+    handleGateFailure("CODEX_ERROR", `Codex handoff review failed. Latest output: ${outputPath}\n${trimForReason(rawOutput)}`);
     return;
   }
 
@@ -266,7 +362,7 @@ function main() {
     return;
   }
 
-  emitBlock(`Codex handoff review returned an unexpected format. It must start with ALLOW: or BLOCK:. Latest output: ${outputPath}\n${trimForReason(rawOutput)}`);
+  handleGateFailure("UNEXPECTED_OUTPUT", `Codex handoff review returned an unexpected format. It must start with ALLOW: or BLOCK:. Latest output: ${outputPath}\n${trimForReason(rawOutput)}`);
 }
 
 try {
