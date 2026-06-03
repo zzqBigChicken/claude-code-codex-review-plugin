@@ -45,7 +45,7 @@ $briefLine = if ($brief) { $brief } else { "No brief provided. Mark business-log
 $focusLine = if ($Focus) { $Focus } else { "No extra focus provided." }
 
 $prompt = @"
-Use `$codex-handoff-review.
+Use the codex-handoff-review standard from the installed plugin or repository documentation.
 
 Operate read-only. Do not modify files.
 

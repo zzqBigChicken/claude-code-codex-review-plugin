@@ -1,96 +1,70 @@
-# Codex Handoff Review Skill
+# Codex Handoff Review Plugin
 
-Make Codex review AI-generated code against the business context that produced it.
+Automatically run a Codex review gate when Claude Code finishes a turn after code changes.
 
-This repository packages a Codex skill for a common multi-agent workflow:
+This plugin exists for one problem: Claude can write code from a long conversation, but Codex only sees the repository unless the context is handed over. The plugin wires that handoff into Claude Code's `Stop` hook.
 
-1. Claude writes or edits code.
-2. Claude creates a handoff brief that captures the user request, business rules, acceptance criteria, changed files, validation, and risks.
-3. Codex reviews the diff against that brief in read-only mode.
+## What It Does
 
-The important point: Codex does not automatically know the Claude conversation. This skill makes the handoff explicit so review results are based on both the code and the intended behavior.
+When Claude Code tries to stop:
 
-## What It Provides
+1. The plugin checks whether the current directory is a Git repository with local changes.
+2. If there are changes, it reads recent user/assistant transcript text from the current Claude session.
+3. It loads the bundled `codex-handoff-review` review standard.
+4. It runs `codex exec` in read-only sandbox mode.
+5. If Codex reports `BLOCK`, Claude is prevented from stopping and must continue fixing or explaining the issue.
 
-- `codex-handoff-review/SKILL.md`: Codex review procedure and severity model.
-- `codex-handoff-review/references/review-brief-template.md`: Required handoff brief template.
-- `codex-handoff-review/references/claude-handoff-instruction.md`: A Claude-side instruction snippet.
-- `codex-handoff-review/scripts/run-codex-review.ps1`: Optional read-only wrapper around `codex exec`.
+No manual `/codex:review` command is required after the plugin is installed and enabled.
 
-## When To Use
-
-Use this when:
-
-- Claude Code writes code and you want Codex to review it.
-- Codex writes code and should self-review against explicit requirements.
-- A PR was created by an AI agent and the reviewer needs more than a raw diff.
-- Business logic, permissions, save/load flows, data contracts, or edge cases matter.
-
-Do not rely on this as a replacement for tests, CI, or human approval on high-risk changes.
-
-## Installation
-
-Copy the skill folder into your Codex skills directory:
-
-```powershell
-Copy-Item -Recurse .\codex-handoff-review $env:USERPROFILE\.codex\skills\
-```
-
-If your Codex installation uses a custom `CODEX_HOME`, copy it there instead:
-
-```powershell
-Copy-Item -Recurse .\codex-handoff-review "$env:CODEX_HOME\skills\"
-```
-
-Restart Codex after installing the skill.
-
-## Local Claude Code Flow
-
-Add the snippet in `codex-handoff-review/references/claude-handoff-instruction.md` to your Claude project instructions.
-
-Claude should finish a code change by producing a brief like:
-
-```markdown
-Objective:
-Required behavior:
-Changed files:
-Important business rules:
-Data/API/UI contracts:
-Known risks:
-Validation already run:
-Out of scope:
-```
-
-Then run Codex review through the Codex companion plugin:
+## Repository Layout
 
 ```text
-/codex:adversarial-review --background
-Review the current diff against this handoff brief:
-[paste brief]
+.claude-plugin/plugin.json
+hooks/hooks.json
+scripts/codex-handoff-review-stop.mjs
+scripts/run-codex-review.ps1
+skills/codex-handoff-review/SKILL.md
+skills/codex-handoff-review/agents/openai.yaml
+skills/codex-handoff-review/references/review-brief-template.md
+skills/codex-handoff-review/references/claude-handoff-instruction.md
 ```
 
-Or use the local wrapper:
+## Requirements
+
+- Claude Code with plugin and hook support.
+- Codex CLI available as `codex` on `PATH`.
+- Codex authenticated locally.
+- Git repository workspace.
+
+## Install
+
+Clone this repository, then install it as a Claude Code plugin from the local path.
 
 ```powershell
-.\codex-handoff-review\scripts\run-codex-review.ps1 -Repo D:\Code\project -BriefPath .\review-brief.md
+git clone https://github.com/zzqBigChicken/codex-handoff-review-skill.git
+cd codex-handoff-review-skill
+claude --plugin-dir .
 ```
 
-The wrapper fails clearly if `codex` is not installed or available on `PATH`.
+If you use Claude Code's plugin marketplace flow, add this repository as a plugin source and install `codex-handoff-review`.
 
-## GitHub Flow
+After enabling the plugin, restart or reload Claude Code so hooks are picked up.
 
-For PR-based work, put the handoff brief in one of these places:
+## How Results Appear
 
-- PR body
-- Linked issue
-- `docs/review-brief.md`
-- OpenSpec change document
+- `BLOCK`: Claude Code shows the hook block reason, including Codex's review summary. Claude must continue before ending the turn.
+- `ALLOW`: Claude is allowed to stop.
+- Latest full output is written to plugin data when `CLAUDE_PLUGIN_DATA` is available:
 
-Then run Codex review with your preferred GitHub integration, such as Codex Cloud review or a workflow that invokes Codex CLI. The review agent should be told to use `$codex-handoff-review`.
+```text
+${CLAUDE_PLUGIN_DATA}/latest-review.md
+```
+
+The hook also writes timestamped review files in the same directory.
 
 ## Review Standard
 
-The skill asks Codex to check:
+The hook asks Codex to check:
 
 - Requirement compliance
 - Business logic and state transitions
@@ -100,21 +74,42 @@ The skill asks Codex to check:
 - Error, null, empty, concurrent, and idempotent paths
 - Missing or weak validation
 
-Output starts with findings and uses these severities:
+Codex must start its final answer with:
 
-- `BLOCKER`
-- `HIGH`
-- `MEDIUM`
-- `LOW`
-- `VERIFICATION-GAP`
+```text
+ALLOW:
+```
 
-## Limitations
+or:
 
-- Codex cannot inspect hidden Claude reasoning.
-- If the brief is missing, business-logic compliance is not knowable.
-- Large diffs can still hide issues.
-- The workflow improves review coverage but does not prove correctness.
+```text
+BLOCK:
+```
+
+The hook blocks Claude only when Codex returns `BLOCK` or when Codex cannot run for a changed Git working tree.
+
+## Optional Manual Review
+
+You can still run the bundled wrapper manually:
+
+```powershell
+.\scripts\run-codex-review.ps1 -Repo D:\Code\project -BriefPath .\review-brief.md
+```
+
+Use `-DryRun` to verify the generated command without starting Codex:
+
+```powershell
+.\scripts\run-codex-review.ps1 -Repo D:\Code\project -AllowNoBrief -DryRun
+```
+
+## Important Limits
+
+- This is not formal verification.
+- Codex still cannot see hidden Claude reasoning.
+- The hook passes recent visible Claude transcript text to Codex. Do not include secrets in prompts.
+- Very large or vague conversations can still produce incomplete review context.
+- Tests, CI, and human review remain necessary for high-risk changes.
 
 ## Security
 
-Do not put secrets, passwords, tokens, private keys, or customer data into the handoff brief. Use short descriptions and local file references when sensitive evidence is needed.
+Do not put secrets, passwords, tokens, private keys, customer data, or production credentials into Claude prompts, handoff briefs, or review output. The plugin deliberately ignores tool result bodies when extracting transcript context, but user and assistant text can still contain sensitive information.
