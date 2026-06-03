@@ -15,6 +15,7 @@ const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_FAIL_MODE = "block";
 const DEFAULT_MAX_BASELINE_CHARS = 50000;
 const DEFAULT_MAX_CHANGED_FILES = 80;
+const DEFAULT_MAX_TRACKED_FILES = 80;
 const SECRET_PATTERNS = [
   { name: "GitHub token", pattern: /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}\b/g },
   { name: "GitHub fine-grained token", pattern: /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g },
@@ -230,6 +231,15 @@ function readSessionBaseline(hookInput, cwd) {
   return baseline.cwd === cwd ? baseline : null;
 }
 
+function readSessionTracker(hookInput) {
+  const sessionId = hookInput.session_id || process.env.CLAUDE_CODE_SESSION_ID || "default";
+  const fullPath = path.join(dataRoot(), "sessions", `${sessionKey(sessionId)}.json`);
+  if (!fs.existsSync(fullPath)) {
+    return null;
+  }
+  return JSON.parse(fs.readFileSync(fullPath, "utf8"));
+}
+
 function trimBlock(text, maxChars) {
   const value = String(text || "").trim();
   return value.length > maxChars ? `${value.slice(0, maxChars)}\n...[truncated]` : value;
@@ -268,6 +278,41 @@ function changedFilesBlock(files) {
   return visible.map((file) => `- ${file}`).join("\n") + suffix;
 }
 
+function trackedFilesBlock(tracker) {
+  const files = tracker?.touchedFiles || [];
+  if (!files.length) {
+    return "No Claude file tool edits were recorded for this session.";
+  }
+  const maxFiles = envNumber("CODEX_HANDOFF_REVIEW_MAX_TRACKED_FILES", DEFAULT_MAX_TRACKED_FILES);
+  const visible = files.slice(0, maxFiles);
+  const suffix = files.length > visible.length ? `\n...and ${files.length - visible.length} more tracked file(s).` : "";
+  return visible.map((file) => `- ${file}`).join("\n") + suffix;
+}
+
+function autoBrief({ hookInput, transcript, brief, baseline, changedFiles, tracker }) {
+  if (brief) {
+    return "Explicit brief file was provided; use it as the primary handoff brief.";
+  }
+
+  const lastAssistantMessage = String(hookInput.last_assistant_message ?? "").trim();
+  const transcriptPresent = Boolean(transcript);
+  const baselinePresent = Boolean(baseline);
+  const trackedCount = tracker?.touchedFiles?.length || 0;
+  const changedCount = changedFiles.length;
+
+  return [
+    "Auto-generated handoff brief:",
+    `- Objective source: infer from recent visible transcript and last assistant message.`,
+    `- Last assistant summary: ${lastAssistantMessage || "not provided"}`,
+    `- Transcript available: ${transcriptPresent ? "yes" : "no"}`,
+    `- Session baseline available: ${baselinePresent ? "yes" : "no"}`,
+    `- Claude file-tool edits recorded: ${trackedCount}`,
+    `- Current changed files: ${changedCount}`,
+    "- Review priority: files recorded by PostToolUse first, then current Git changed files, then relevant call chains.",
+    "- If business rules are not visible in transcript/brief/code, report the missing context according to the missing-context policy."
+  ].join("\n");
+}
+
 function scanSecrets(label, text) {
   const findings = [];
   const value = String(text || "");
@@ -292,13 +337,14 @@ function secretScanFindings({ transcript, brief, lastAssistantMessage }) {
   ];
 }
 
-function buildPrompt({ cwd, hookInput, transcript, brief, baseline, changedFiles, failOnMissingContext, skillText }) {
+function buildPrompt({ cwd, hookInput, transcript, brief, baseline, changedFiles, tracker, generatedBrief, failOnMissingContext, skillText }) {
   const lastAssistantMessage = String(hookInput.last_assistant_message ?? "").trim();
   const briefBlock = brief ? `Brief file (${brief.path}):\n${brief.text}` : "No review brief file found.";
   const transcriptBlock = transcript || "No recent transcript text recovered.";
   const lastAssistantBlock = lastAssistantMessage || "No last assistant message provided by hook input.";
   const baselineText = baselineBlock(baseline);
   const changedFilesText = changedFilesBlock(changedFiles);
+  const trackedFilesText = trackedFilesBlock(tracker);
 
   return `You are running as a read-only Codex review gate for Claude Code.
 
@@ -309,6 +355,7 @@ ${skillText}
 Gate protocol:
 - Inspect the current Git working tree in: ${cwd}
 - Review the actual diff and relevant call chain.
+- Prefer files recorded by Claude file-tool tracking when deciding the session's primary review target.
 - If a SessionStart baseline is present, prioritize changes made after that baseline; pre-existing dirty-worktree changes are context unless they directly affect the session delta.
 - Use the brief/transcript as intent context, but trust code facts over prose.
 - Do not modify files.
@@ -321,9 +368,17 @@ Handoff context:
 
 ${briefBlock}
 
+Generated handoff brief:
+
+${generatedBrief}
+
 Session baseline:
 
 ${baselineText}
+
+Claude file-tool tracked files:
+
+${trackedFilesText}
 
 Changed files:
 
@@ -416,9 +471,11 @@ function main() {
 
   const skillText = fs.readFileSync(SKILL_PATH, "utf8");
   const baseline = readSessionBaseline(hookInput, cwd);
+  const tracker = readSessionTracker(hookInput);
   const changedFiles = currentChangedFiles(cwd);
+  const generatedBrief = autoBrief({ hookInput, transcript, brief, baseline, changedFiles, tracker });
   const failOnMissingContext = envFlag("CODEX_HANDOFF_REVIEW_FAIL_ON_MISSING_CONTEXT", true);
-  const prompt = buildPrompt({ cwd, hookInput, transcript, brief, baseline, changedFiles, failOnMissingContext, skillText });
+  const prompt = buildPrompt({ cwd, hookInput, transcript, brief, baseline, changedFiles, tracker, generatedBrief, failOnMissingContext, skillText });
 
   if (process.env.CODEX_HANDOFF_REVIEW_DRY_RUN === "1") {
     process.stdout.write(JSON.stringify({
@@ -427,7 +484,9 @@ function main() {
       hasTranscript: Boolean(transcript),
       hasBrief: Boolean(brief),
       hasBaseline: Boolean(baseline),
+      hasToolTracker: Boolean(tracker),
       changedFiles,
+      trackedFiles: tracker?.touchedFiles || [],
       failOnMissingContext,
       promptChars: prompt.length
     }, null, 2));

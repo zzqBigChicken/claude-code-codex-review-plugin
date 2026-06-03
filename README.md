@@ -12,6 +12,7 @@ Without a handoff gate, Claude can finish a coding task before another reviewer 
 Claude Code session starts
 -> SessionStart hook records the starting Git state
 -> Claude Code changes files
+-> PostToolUse hook tracks Claude-edited files
 -> Stop hook runs
 -> Secret scan protects visible context before Codex sees it
 -> Codex reviews visible transcript context + session delta/current Git diff
@@ -24,13 +25,15 @@ Claude Code session starts
 When Claude Code tries to stop:
 
 1. `SessionStart` records the starting Git status and diff for the Claude Code session.
-2. `Stop` checks whether the current directory is a Git repository with local changes.
-3. If there are changes, it reads recent user/assistant transcript text from the current Claude session.
-4. It blocks before Codex runs if the visible transcript or brief appears to contain secrets.
-5. It loads the bundled `codex-handoff-review` review standard.
-6. It runs `codex exec` in read-only sandbox mode.
-7. Codex reviews changes after the session baseline first, then falls back to the full current Git working tree when the session delta cannot be isolated.
-8. If Codex reports `BLOCK`, Claude is prevented from stopping and must continue fixing or explaining the issue.
+2. `PostToolUse` records files touched by Claude file-edit tools such as `Edit`, `Write`, and `MultiEdit`.
+3. `Stop` checks whether the current directory is a Git repository with local changes.
+4. If there are changes, it reads recent user/assistant transcript text from the current Claude session.
+5. It blocks before Codex runs if the visible transcript or brief appears to contain secrets.
+6. It builds an automatic handoff brief when no explicit `review-brief.md` exists.
+7. It loads the bundled `codex-handoff-review` review standard.
+8. It runs `codex exec` in read-only sandbox mode.
+9. Codex reviews Claude-tracked files first, then changes after the session baseline, then falls back to the full current Git working tree when the session delta cannot be isolated.
+10. If Codex reports `BLOCK`, Claude is prevented from stopping and must continue fixing or explaining the issue.
 
 No manual `/codex:review` command is required after the plugin is installed and enabled.
 
@@ -39,6 +42,7 @@ No manual `/codex:review` command is required after the plugin is installed and 
 ```text
 .claude-plugin/plugin.json
 hooks/hooks.json
+scripts/codex-handoff-review-post-tool-use.mjs
 scripts/codex-handoff-review-stop.mjs
 scripts/run-codex-review.ps1
 skills/codex-handoff-review/SKILL.md
@@ -88,6 +92,7 @@ Set environment variables before launching Claude Code to tune that behavior:
 | `CODEX_HANDOFF_REVIEW_MAX_BASELINE_DIFF_CHARS` | number | `50000` | Baseline diff chars recorded at `SessionStart`. |
 | `CODEX_HANDOFF_REVIEW_MAX_BASELINE_CHARS` | number | `50000` | Baseline chars included in the Codex prompt. |
 | `CODEX_HANDOFF_REVIEW_MAX_CHANGED_FILES` | number | `80` | Changed files listed in the Codex prompt. |
+| `CODEX_HANDOFF_REVIEW_MAX_TRACKED_FILES` | number | `80` | Claude file-tool touched files listed in the Codex prompt. |
 | `CODEX_HANDOFF_REVIEW_MAX_OUTPUT_CHARS` | number | `8000` | Review text included in hook block reason. |
 | `CODEX_HANDOFF_REVIEW_TIMEOUT_MS` | number | `900000` | Codex execution timeout. |
 | `CODEX_HANDOFF_REVIEW_CODEX_COMMAND` | command path/name | `codex` | Override the Codex executable. |
@@ -118,6 +123,12 @@ Baseline files are written under:
 ${CLAUDE_PLUGIN_DATA}/baselines/
 ```
 
+Claude file-tool tracking files are written under:
+
+```text
+${CLAUDE_PLUGIN_DATA}/sessions/
+```
+
 ## Review Standard
 
 The hook asks Codex to check:
@@ -130,7 +141,7 @@ The hook asks Codex to check:
 - Error, null, empty, concurrent, and idempotent paths
 - Missing or weak validation
 
-Codex also receives a changed-file list and must include these sections after the required prefix:
+Codex also receives a changed-file list, Claude file-tool touched files, and an automatic handoff brief when no explicit brief exists. It must include these sections after the required prefix:
 
 ```text
 Findings
@@ -177,7 +188,7 @@ npm test
 claude plugin validate .
 ```
 
-The smoke test creates a temporary Git repo and fake `codex` command, then verifies both `ALLOW:` and `BLOCK:` paths without calling the real Codex CLI. It also covers baseline detection, clean-repo no-op behavior, fail-open missing Codex, secret blocking, changed-file reporting, and mismatched baseline fallback.
+The smoke test creates a temporary Git repo and fake `codex` command, then verifies both `ALLOW:` and `BLOCK:` paths without calling the real Codex CLI. It also covers baseline detection, PostToolUse file tracking, clean-repo no-op behavior, fail-open missing Codex, secret blocking, changed-file reporting, and mismatched baseline fallback.
 
 ## Important Limits
 
@@ -185,6 +196,7 @@ The smoke test creates a temporary Git repo and fake `codex` command, then verif
 - Codex still cannot see hidden Claude reasoning.
 - Codex receives recent visible transcript text, the last assistant message, optional brief files, and Git facts.
 - A local secret scan runs before Codex receives context, but it is pattern-based and cannot guarantee every secret is caught.
+- PostToolUse file tracking only records Claude file-edit tool calls that the hook receives. Shell commands that edit files are not attributed as Claude file-tool edits, though Git diff still catches the resulting changes.
 - The session baseline helps separate pre-existing changes from current-session changes. It cannot perfectly reconstruct a per-message patch if the repository starts dirty and Claude edits the same lines later.
 - For exact per-task review, start Claude Code from a clean Git state or write a task-specific `review-brief.md`.
 - The hook passes recent visible Claude transcript text to Codex. Do not include secrets in prompts.

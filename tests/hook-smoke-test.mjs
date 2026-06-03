@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const HOOK_SCRIPT = path.join(REPO_ROOT, "scripts", "codex-handoff-review-stop.mjs");
 const SESSION_START_SCRIPT = path.join(REPO_ROOT, "scripts", "codex-handoff-review-session-start.mjs");
+const POST_TOOL_USE_SCRIPT = path.join(REPO_ROOT, "scripts", "codex-handoff-review-post-tool-use.mjs");
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -89,6 +90,27 @@ function runSessionStart(repo, dataDir) {
   });
 }
 
+function runPostToolUse(repo, dataDir, filePath = path.join(repo, "feature.txt")) {
+  const input = JSON.stringify({
+    cwd: repo,
+    session_id: "test-session",
+    tool_name: "Edit",
+    tool_input: {
+      file_path: filePath
+    }
+  });
+
+  return run("node", [POST_TOOL_USE_SCRIPT], {
+    input,
+    cwd: REPO_ROOT,
+    env: {
+      ...process.env,
+      CLAUDE_PLUGIN_DATA: dataDir
+    },
+    check: false
+  });
+}
+
 function assert(condition, message) {
   if (!condition) {
     throw new Error(message);
@@ -109,6 +131,10 @@ try {
   assert(baselineResult.status === 0, "SessionStart baseline run should exit 0");
   assert(fs.existsSync(path.join(dataDir, "baselines", "test-session.json")), "SessionStart should write a baseline file");
 
+  const postToolUseResult = runPostToolUse(repo, dataDir);
+  assert(postToolUseResult.status === 0, "PostToolUse tracker run should exit 0");
+  assert(fs.existsSync(path.join(dataDir, "sessions", "test-session.json")), "PostToolUse should write a session tracker file");
+
   const dryRunResult = runHook(repo, {
     ...envBase,
     CODEX_HANDOFF_REVIEW_DRY_RUN: "1",
@@ -116,6 +142,7 @@ try {
   });
   assert(dryRunResult.status === 0, "dry run should exit 0");
   assert(dryRunResult.stdout.includes('"hasBaseline": true'), "dry run should detect the SessionStart baseline");
+  assert(dryRunResult.stdout.includes('"hasToolTracker": true'), "dry run should detect the PostToolUse tracker");
   assert(dryRunResult.stdout.includes('"feature.txt"'), "dry run should include changed files");
 
   const allowResult = runHook(repo, {

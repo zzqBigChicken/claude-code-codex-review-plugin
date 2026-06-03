@@ -12,6 +12,19 @@
         ]
       }
     ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/codex-handoff-review-post-tool-use.mjs\"",
+            "timeout": 30,
+            "statusMessage": "Tracking Claude-edited files"
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

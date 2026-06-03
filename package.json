@@ -1,10 +1,10 @@
 {
   "name": "claude-code-codex-review-plugin",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "validate": "node --check scripts/codex-handoff-review-stop.mjs && node --check scripts/codex-handoff-review-session-start.mjs",
+    "validate": "node --check scripts/codex-handoff-review-stop.mjs && node --check scripts/codex-handoff-review-session-start.mjs && node --check scripts/codex-handoff-review-post-tool-use.mjs",
     "test": "node tests/hook-smoke-test.mjs"
   }
 }
