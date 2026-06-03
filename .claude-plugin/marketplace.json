@@ -1,0 +1,29 @@
+{
+  "name": "codex-handoff-review",
+  "owner": {
+    "name": "zzqBigChicken"
+  },
+  "metadata": {
+    "description": "Claude Code plugin that runs a Codex review gate after AI-generated code changes.",
+    "version": "0.2.0"
+  },
+  "plugins": [
+    {
+      "name": "codex-handoff-review",
+      "description": "Automatically runs a Codex stop-time review gate for Claude Code changes using recent transcript context and repository diff.",
+      "version": "0.2.0",
+      "author": {
+        "name": "zzqBigChicken"
+      },
+      "source": "./",
+      "keywords": [
+        "codex",
+        "claude-code",
+        "code-review",
+        "review-gate",
+        "handoff"
+      ],
+      "category": "workflow"
+    }
+  ]
+}
