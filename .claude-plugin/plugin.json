@@ -1,7 +1,8 @@
 {
   "name": "codex-handoff-review",
   "displayName": "Claude Code Codex Review",
-  "version": "0.7.0",
+  "version": "0.7.1",
+  "defaultEnabled": true,
   "description": "Claude Code plugin that automatically runs a Codex review gate after AI-generated code changes.",
   "repository": "https://github.com/zzqBigChicken/claude-code-codex-review-plugin",
   "author": {

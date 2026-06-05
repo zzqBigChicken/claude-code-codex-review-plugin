@@ -35,7 +35,7 @@ When Claude Code tries to stop:
 9. Codex reviews Claude-tracked files first, then changes after the session baseline, then falls back to the full current Git working tree when the session delta cannot be isolated.
 10. If Codex reports `BLOCK`, Claude is prevented from stopping and must continue fixing or explaining the issue.
 
-No manual `/codex:review` command is required after the plugin is installed and enabled.
+No manual `/codex:review` command is required after the plugin is installed and enabled. The plugin declares `defaultEnabled: true`, so new installs are enabled automatically unless a user's Claude Code settings explicitly disable it.
 
 ## Repository Layout
 
@@ -69,7 +69,13 @@ claude plugin marketplace add . --scope user
 claude plugin install codex-handoff-review@codex-handoff-review --scope user
 ```
 
-After enabling the plugin, restart or reload Claude Code so hooks are picked up.
+The plugin declares `defaultEnabled: true`, so a fresh install is enabled by default. If this plugin was previously disabled, enable it explicitly:
+
+```powershell
+claude plugin enable codex-handoff-review@codex-handoff-review --scope user
+```
+
+After installing or enabling the plugin, restart or reload Claude Code so hooks are picked up.
 
 ## Configuration
 
