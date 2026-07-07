@@ -26,13 +26,13 @@ When Claude Code tries to stop:
 
 1. `SessionStart` records the starting Git status and diff for the Claude Code session.
 2. `PostToolUse` records files touched by Claude file-edit tools such as `Edit`, `Write`, `MultiEdit`, `NotebookEdit`, and Git changes observed after `Bash`.
-3. `Stop` checks whether the current directory is a Git repository with local changes.
+3. `Stop` checks whether the current directory, or Git repositories below it, have local changes.
 4. If there are changes, it reads recent user/assistant transcript text from the current Claude session.
 5. It blocks before Codex runs if the visible transcript or brief appears to contain secrets.
 6. It builds an automatic handoff brief when no explicit `review-brief.md` exists.
 7. It loads the bundled `codex-handoff-review` review standard.
 8. It runs `codex exec` in read-only sandbox mode.
-9. Codex reviews Claude-tracked files first, then changes after the session baseline, then falls back to the full current Git working tree when the session delta cannot be isolated.
+9. Codex reviews each changed repository. It checks Claude-tracked files first, then changes after the session baseline when available, then falls back to the full current Git working tree when the session delta cannot be isolated.
 10. If Codex reports `BLOCK`, Claude is prevented from stopping and must continue fixing or explaining the issue.
 
 No manual `/codex:review` command is required after the plugin is installed and enabled. The plugin declares `defaultEnabled: true`, so new installs are enabled automatically unless a user's Claude Code settings explicitly disable it.
@@ -101,6 +101,8 @@ Set environment variables before launching Claude Code to tune that behavior:
 | `CODEX_HANDOFF_REVIEW_HISTORY_LIMIT` | number | `100` | Timestamped review markdown files to keep in plugin data. |
 | `CODEX_HANDOFF_REVIEW_MAX_CHANGED_FILES` | number | `80` | Changed files listed in the Codex prompt. |
 | `CODEX_HANDOFF_REVIEW_MAX_TRACKED_FILES` | number | `80` | Claude file-tool touched files listed in the Codex prompt. |
+| `CODEX_HANDOFF_REVIEW_SCAN_DEPTH` | number | `3` | Maximum directory depth scanned for child Git repositories when the current directory is a workspace root. |
+| `CODEX_HANDOFF_REVIEW_MAX_REPOS` | number | `30` | Maximum Git repositories considered during one Stop hook run. |
 | `CODEX_HANDOFF_REVIEW_MAX_OUTPUT_CHARS` | number | `8000` | Review text included in hook block reason. |
 | `CODEX_HANDOFF_REVIEW_TIMEOUT_MS` | number | `900000` | Codex execution timeout. |
 | `CODEX_HANDOFF_REVIEW_CODEX_COMMAND` | command path/name | `codex` | Override the Codex executable. |
@@ -176,7 +178,7 @@ or:
 BLOCK:
 ```
 
-The hook blocks Claude only when Codex returns `BLOCK` or when Codex cannot run for a changed Git working tree.
+The hook blocks Claude when any changed repository returns `BLOCK`, or when Codex cannot run for a changed Git working tree.
 
 ## Optional Manual Review
 
@@ -211,7 +213,7 @@ The smoke test creates a temporary Git repo and fake `codex` command, then verif
 - Codex receives recent visible transcript text, the last assistant message, optional brief files, and Git facts.
 - A local secret scan runs before Codex receives context, but it is pattern-based and cannot guarantee every secret is caught.
 - PostToolUse file tracking records Claude file-edit tool calls and, for `Bash`, snapshots the current Git changed files after the command. It cannot prove exactly which shell command caused each changed file.
-- The session baseline helps separate pre-existing changes from current-session changes. It cannot perfectly reconstruct a per-message patch if the repository starts dirty and Claude edits the same lines later.
+- The session baseline helps separate pre-existing changes from current-session changes. It is only available for repositories captured by `SessionStart`; child repositories discovered later are reviewed from their current Git diff.
 - For exact per-task review, start Claude Code from a clean Git state or write a task-specific `review-brief.md`.
 - The hook passes recent visible Claude transcript text to Codex. Do not include secrets in prompts.
 - Very large or vague conversations can still produce incomplete review context.

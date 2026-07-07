@@ -5,6 +5,7 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { discoverGitWorkTrees, gitChangedFiles, hasGitChanges } from "./repo-discovery.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PLUGIN_ROOT = path.resolve(SCRIPT_DIR, "..");
@@ -91,19 +92,6 @@ function run(command, args, cwd, options = {}) {
   });
 }
 
-function isGitWorkTree(cwd) {
-  const result = run("git", ["rev-parse", "--is-inside-work-tree"], cwd);
-  return result.status === 0 && result.stdout.trim() === "true";
-}
-
-function hasGitChanges(cwd) {
-  const status = run("git", ["status", "--porcelain"], cwd);
-  if (status.status !== 0) {
-    throw new Error(`Unable to read git status: ${status.stderr || status.stdout}`);
-  }
-  return status.stdout.trim().length > 0;
-}
-
 function gitOutput(cwd, args) {
   const result = run("git", args, cwd);
   if (result.status !== 0) {
@@ -123,16 +111,6 @@ function gitBaseRef(cwd) {
   }
   const branch = gitCurrentBranch(cwd);
   return branch && branch !== "master" ? "origin/master" : "";
-}
-
-function currentChangedFiles(cwd) {
-  const output = gitOutput(cwd, ["status", "--porcelain"]);
-  return output
-    .split(/\r?\n/)
-    .map((line) => line.replace(/\s+$/, ""))
-    .filter(Boolean)
-    .map((line) => line.slice(3).replace(/^.* -> /, ""))
-    .filter(Boolean);
 }
 
 function currentDiff(cwd) {
@@ -260,6 +238,21 @@ function sessionKey(sessionId) {
   return String(sessionId || "default").replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
+function samePath(left, right) {
+  function normalize(value) {
+    const resolved = path.resolve(value || "");
+    try {
+      return fs.realpathSync.native(resolved);
+    } catch {
+      return resolved;
+    }
+  }
+
+  const leftPath = normalize(left);
+  const rightPath = normalize(right);
+  return process.platform === "win32" ? leftPath.toLowerCase() === rightPath.toLowerCase() : leftPath === rightPath;
+}
+
 function readSessionBaseline(hookInput, cwd) {
   const sessionId = hookInput.session_id || process.env.CLAUDE_CODE_SESSION_ID || "default";
   const fullPath = path.join(dataRoot(), "baselines", `${sessionKey(sessionId)}.json`);
@@ -268,7 +261,7 @@ function readSessionBaseline(hookInput, cwd) {
   }
 
   const baseline = JSON.parse(fs.readFileSync(fullPath, "utf8"));
-  return baseline.cwd === cwd ? baseline : null;
+  return samePath(baseline.cwd, cwd) ? baseline : null;
 }
 
 function readSessionTracker(hookInput) {
@@ -353,7 +346,7 @@ function autoBrief({ hookInput, transcript, brief, baseline, changedFiles, track
   ].join("\n");
 }
 
-function reviewMetadata({ cwd, rawOutput, outputPath, baseline, tracker, changedFiles, baseRef }) {
+function reviewMetadata({ cwd, rawOutput, outputPath, baseline, tracker, changedFiles, baseRef, reviewRepos }) {
   const firstLine = firstMeaningfulLine(rawOutput);
   const decision = firstLine.startsWith("BLOCK:") ? "block" : firstLine.startsWith("ALLOW:") ? "allow" : "unknown";
   return {
@@ -363,6 +356,7 @@ function reviewMetadata({ cwd, rawOutput, outputPath, baseline, tracker, changed
     outputPath,
     generatedAt: new Date().toISOString(),
     baseRef: baseRef || null,
+    reviewRepos: reviewRepos || [cwd],
     hasBaseline: Boolean(baseline),
     trackedFiles: tracker?.touchedFiles || [],
     changedFiles
@@ -509,6 +503,17 @@ function firstMeaningfulLine(text) {
     .find(Boolean) || "";
 }
 
+function aggregateReviewOutput(items) {
+  const hasBlock = items.some((item) => item.firstLine.startsWith("BLOCK:"));
+  const prefix = hasBlock ? "BLOCK:" : "ALLOW:";
+  const sections = items.map((item) => [
+    `## Repository: ${item.cwd}`,
+    "",
+    item.rawOutput || "No Codex output."
+  ].join("\n"));
+  return [prefix, "", ...sections].join("\n");
+}
+
 function trimForReason(text) {
   const max = Number(process.env.CODEX_HANDOFF_REVIEW_MAX_OUTPUT_CHARS || DEFAULT_MAX_CODEX_OUTPUT_CHARS);
   const value = String(text || "").trim();
@@ -524,7 +529,8 @@ function main() {
     return;
   }
 
-  if (!isGitWorkTree(cwd) || !hasGitChanges(cwd)) {
+  const reviewRepos = discoverGitWorkTrees(cwd).filter((repo) => hasGitChanges(repo));
+  if (!reviewRepos.length) {
     return;
   }
 
@@ -534,73 +540,129 @@ function main() {
     return;
   }
 
-  const transcript = readRecentTranscript(hookInput.transcript_path, maxTranscriptChars);
-  const brief = readOptionalBrief(cwd);
   const lastAssistantMessage = String(hookInput.last_assistant_message ?? "").trim();
-  const diff = currentDiff(cwd);
-  if (handleSecretFindings(secretScanFindings({ transcript, brief, lastAssistantMessage, diff }))) {
-    return;
-  }
-
+  const transcript = readRecentTranscript(hookInput.transcript_path, maxTranscriptChars);
   const skillText = fs.readFileSync(SKILL_PATH, "utf8");
-  const baseline = readSessionBaseline(hookInput, cwd);
   const tracker = readSessionTracker(hookInput);
-  const changedFiles = currentChangedFiles(cwd);
-  const baseRef = gitBaseRef(cwd);
-  const branchStat = branchDiffStat(cwd, baseRef);
-  const generatedBrief = autoBrief({ hookInput, transcript, brief, baseline, changedFiles, tracker });
   const failOnMissingContext = envFlag("CODEX_HANDOFF_REVIEW_FAIL_ON_MISSING_CONTEXT", true);
-  const prompt = buildPrompt({ cwd, hookInput, transcript, brief, baseline, changedFiles, tracker, generatedBrief, baseRef, branchStat, failOnMissingContext, skillText });
+  const repoContexts = reviewRepos.map((repo) => {
+    const brief = readOptionalBrief(repo);
+    const diff = currentDiff(repo);
+    const baseline = readSessionBaseline(hookInput, repo);
+    const changedFiles = gitChangedFiles(repo);
+    const baseRef = gitBaseRef(repo);
+    const branchStat = branchDiffStat(repo, baseRef);
+    const generatedBrief = autoBrief({ hookInput, transcript, brief, baseline, changedFiles, tracker });
+    return { cwd: repo, brief, diff, baseline, changedFiles, baseRef, branchStat, generatedBrief };
+  });
+
+  for (const context of repoContexts) {
+    if (handleSecretFindings(secretScanFindings({ transcript, brief: context.brief, lastAssistantMessage, diff: context.diff }))) {
+      return;
+    }
+  }
 
   if (process.env.CODEX_HANDOFF_REVIEW_DRY_RUN === "1") {
     process.stdout.write(JSON.stringify({
       dryRun: true,
       cwd,
-      hasTranscript: Boolean(transcript),
-      hasBrief: Boolean(brief),
-      hasBaseline: Boolean(baseline),
-      hasToolTracker: Boolean(tracker),
-      baseRef: baseRef || null,
-      changedFiles,
+      reviewRepos,
+      repos: repoContexts.map((context) => ({
+        cwd: context.cwd,
+        hasTranscript: Boolean(transcript),
+        hasBrief: Boolean(context.brief),
+        hasBaseline: Boolean(context.baseline),
+        hasToolTracker: Boolean(tracker),
+        baseRef: context.baseRef || null,
+        changedFiles: context.changedFiles
+      })),
       trackedFiles: tracker?.touchedFiles || [],
       failOnMissingContext,
-      promptChars: prompt.length
+      promptChars: repoContexts.reduce((total, context) => total + buildPrompt({
+        cwd: context.cwd,
+        hookInput,
+        transcript,
+        brief: context.brief,
+        baseline: context.baseline,
+        changedFiles: context.changedFiles,
+        tracker,
+        generatedBrief: context.generatedBrief,
+        baseRef: context.baseRef,
+        branchStat: context.branchStat,
+        failOnMissingContext,
+        skillText
+      }).length, 0)
     }, null, 2));
     process.stdout.write("\n");
     return;
   }
 
-  const result = run(codex.command, [...codex.prefixArgs, "exec", "--cd", cwd, "--sandbox", "read-only", "-"], cwd, {
-    input: prompt,
-    timeout: Number(process.env.CODEX_HANDOFF_REVIEW_TIMEOUT_MS || DEFAULT_TIMEOUT_MS)
-  });
+  const reviews = [];
+  for (const context of repoContexts) {
+    const prompt = buildPrompt({
+      cwd: context.cwd,
+      hookInput,
+      transcript,
+      brief: context.brief,
+      baseline: context.baseline,
+      changedFiles: context.changedFiles,
+      tracker,
+      generatedBrief: context.generatedBrief,
+      baseRef: context.baseRef,
+      branchStat: context.branchStat,
+      failOnMissingContext,
+      skillText
+    });
+    const result = run(codex.command, [...codex.prefixArgs, "exec", "--cd", context.cwd, "--sandbox", "read-only", "-"], context.cwd, {
+      input: prompt,
+      timeout: Number(process.env.CODEX_HANDOFF_REVIEW_TIMEOUT_MS || DEFAULT_TIMEOUT_MS)
+    });
 
-  if (result.error?.code === "ETIMEDOUT") {
-    handleGateFailure("TIMEOUT", "Codex handoff review timed out. Run the review manually or fix the timeout before ending.");
-    return;
+    if (result.error?.code === "ETIMEDOUT") {
+      handleGateFailure("TIMEOUT", `Codex handoff review timed out in ${context.cwd}. Run the review manually or fix the timeout before ending.`);
+      return;
+    }
+
+    const rawOutput = `${result.stdout || ""}${result.stderr ? `\n\nSTDERR:\n${result.stderr}` : ""}`.trim();
+    reviews.push({
+      cwd: context.cwd,
+      result,
+      rawOutput,
+      firstLine: firstMeaningfulLine(rawOutput)
+    });
+
+    if (result.status !== 0) {
+      const aggregateOutput = aggregateReviewOutput(reviews);
+      const outputPath = writeReviewOutput(cwd, aggregateOutput);
+      handleGateFailure("CODEX_ERROR", `Codex handoff review failed in ${context.cwd}. Latest output: ${outputPath}\n${trimForReason(rawOutput)}`);
+      return;
+    }
   }
 
-  const rawOutput = `${result.stdout || ""}${result.stderr ? `\n\nSTDERR:\n${result.stderr}` : ""}`.trim();
+  const unexpected = reviews.find((review) => !review.firstLine.startsWith("ALLOW:") && !review.firstLine.startsWith("BLOCK:"));
+  const rawOutput = aggregateReviewOutput(reviews);
   const outputPath = writeReviewOutput(cwd, rawOutput);
-  const metadata = reviewMetadata({ cwd, rawOutput, outputPath, baseline, tracker, changedFiles, baseRef });
+  const metadata = reviewMetadata({
+    cwd,
+    rawOutput,
+    outputPath,
+    baseline: repoContexts.some((context) => context.baseline),
+    tracker,
+    changedFiles: repoContexts.flatMap((context) => context.changedFiles.map((file) => `${context.cwd}:${file}`)),
+    baseRef: repoContexts.map((context) => context.baseRef).filter(Boolean).join(", "),
+    reviewRepos
+  });
   writeReviewMetadata(metadata);
 
-  if (result.status !== 0) {
-    handleGateFailure("CODEX_ERROR", `Codex handoff review failed. Latest output: ${outputPath}\n${trimForReason(rawOutput)}`);
+  if (unexpected) {
+    handleGateFailure("UNEXPECTED_OUTPUT", `Codex handoff review returned an unexpected format for ${unexpected.cwd}. It must start with ALLOW: or BLOCK:. Latest output: ${outputPath}\n${trimForReason(unexpected.rawOutput)}`);
     return;
   }
 
-  const firstLine = firstMeaningfulLine(rawOutput);
-  if (firstLine.startsWith("ALLOW:")) {
-    return;
-  }
-
-  if (firstLine.startsWith("BLOCK:")) {
+  if (reviews.some((review) => review.firstLine.startsWith("BLOCK:"))) {
     emitBlock(`Codex handoff review blocked this stop. Latest output: ${outputPath}\n${trimForReason(rawOutput)}`);
     return;
   }
-
-  handleGateFailure("UNEXPECTED_OUTPUT", `Codex handoff review returned an unexpected format. It must start with ALLOW: or BLOCK:. Latest output: ${outputPath}\n${trimForReason(rawOutput)}`);
 }
 
 try {

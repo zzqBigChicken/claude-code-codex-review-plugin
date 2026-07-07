@@ -29,8 +29,8 @@ function writeMockCodex(tempRoot) {
   return scriptPath;
 }
 
-function createChangedRepo(tempRoot) {
-  const repo = path.join(tempRoot, "repo");
+function createRepo(tempRoot, name, changed) {
+  const repo = path.join(tempRoot, name);
   fs.mkdirSync(repo, { recursive: true });
   run("git", ["init"], { cwd: repo });
   run("git", ["config", "user.email", "test@example.com"], { cwd: repo });
@@ -38,20 +38,18 @@ function createChangedRepo(tempRoot) {
   fs.writeFileSync(path.join(repo, "feature.txt"), "before\n", "utf8");
   run("git", ["add", "feature.txt"], { cwd: repo });
   run("git", ["commit", "-m", "seed"], { cwd: repo });
-  fs.writeFileSync(path.join(repo, "feature.txt"), "after\n", "utf8");
+  if (changed) {
+    fs.writeFileSync(path.join(repo, "feature.txt"), "after\n", "utf8");
+  }
   return repo;
 }
 
+function createChangedRepo(tempRoot) {
+  return createRepo(tempRoot, "repo", true);
+}
+
 function createCleanRepo(tempRoot) {
-  const repo = path.join(tempRoot, "clean-repo");
-  fs.mkdirSync(repo, { recursive: true });
-  run("git", ["init"], { cwd: repo });
-  run("git", ["config", "user.email", "test@example.com"], { cwd: repo });
-  run("git", ["config", "user.name", "Test User"], { cwd: repo });
-  fs.writeFileSync(path.join(repo, "feature.txt"), "clean\n", "utf8");
-  run("git", ["add", "feature.txt"], { cwd: repo });
-  run("git", ["commit", "-m", "seed"], { cwd: repo });
-  return repo;
+  return createRepo(tempRoot, "clean-repo", false);
 }
 
 function runHook(repo, envOverrides = {}) {
@@ -216,6 +214,28 @@ try {
   });
   assert(missingCodex.status === 0, "fail-open missing Codex run should exit 0");
   assert(!missingCodex.stdout.includes('"decision":"block"'), "fail-open missing Codex should not block");
+
+  const workspace = path.join(tempRoot, "workspace");
+  fs.mkdirSync(workspace, { recursive: true });
+  const changedChildRepo = createRepo(workspace, "changed-child", true);
+  createRepo(workspace, "clean-child", false);
+  const multiRepoDryRun = runHook(workspace, {
+    ...envBase,
+    CODEX_HANDOFF_REVIEW_DRY_RUN: "1",
+    CODEX_HANDOFF_REVIEW_CODEX_ARGS: JSON.stringify([mockCodex, "ALLOW: mocked review passed"])
+  });
+  assert(multiRepoDryRun.status === 0, "multi-repo dry run should exit 0");
+  assert(multiRepoDryRun.stdout.includes('"reviewRepos"'), "multi-repo dry run should list review repositories");
+  assert(multiRepoDryRun.stdout.includes("changed-child"), "multi-repo dry run should include the dirty child repo");
+  assert(!multiRepoDryRun.stdout.includes("clean-child"), "multi-repo dry run should skip clean child repos");
+
+  const multiRepoAllow = runHook(workspace, {
+    ...envBase,
+    CODEX_HANDOFF_REVIEW_CODEX_ARGS: JSON.stringify([mockCodex, "ALLOW: mocked review passed"])
+  });
+  assert(multiRepoAllow.status === 0, "multi-repo ALLOW run should exit 0");
+  const multiRepoOutput = fs.readFileSync(path.join(dataDir, "latest-review.md"), "utf8");
+  assert(multiRepoOutput.includes("Repository:") && multiRepoOutput.includes("changed-child"), "multi-repo ALLOW run should write an aggregate review");
 
   const secretResult = runHook(repo, {
     ...envBase,

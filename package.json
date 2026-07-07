@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "validate": "node --check scripts/codex-handoff-review-stop.mjs && node --check scripts/codex-handoff-review-session-start.mjs && node --check scripts/codex-handoff-review-post-tool-use.mjs",
+    "validate": "node --check scripts/repo-discovery.mjs && node --check scripts/codex-handoff-review-stop.mjs && node --check scripts/codex-handoff-review-session-start.mjs && node --check scripts/codex-handoff-review-post-tool-use.mjs",
     "test": "node tests/hook-smoke-test.mjs"
   }
 }
